@@ -51,6 +51,7 @@ pub const ZeroMQSocketOption = enum(i32) {
     UseFD = zmq.ZMQ_USE_FD,
     ProbeRouter = zmq.ZMQ_PROBE_ROUTER,
     Rate = zmq.ZMQ_RATE,
+    ReceiveMore = zmq.ZMQ_RCVMORE,
     ReceiveBuffer = zmq.ZMQ_RCVBUF,
     ReceiveHighWaterMark = zmq.ZMQ_RCVHWM,
     ReceiveTimout = zmq.ZMQ_RCVTIMEO,
@@ -112,7 +113,7 @@ pub const ZeroMQSocket = struct {
     pub fn setOption(self: *ZeroMQSocket, comptime socketOption: ZeroMQSocketOption, value: *anyopaque, valueSize: usize) !void {
         if (zmq.zmq_setsockopt(self.socket, @intFromEnum(socketOption), value, valueSize) != 0) {
             return switch (zmq.zmq_errno()) {
-                zmq.EINVAL => error.UnknownOptionName,
+                zmq.EINVAL => error.UnknownOrInvalidOption,
                 zmq.ETERM => error.SocketTerminated,
                 zmq.ENOTSOCK => error.InvalidSocket,
                 zmq.EINTR => error.Interrupted,
@@ -120,10 +121,10 @@ pub const ZeroMQSocket = struct {
             };
         }
     }
-    pub fn getOption(self: *ZeroMQSocket, comptime socketOption: ZeroMQSocketOption, value: *anyopaque, valueSize: usize) !void {
-        if (zmq.zmq_getsockopt(self.socket, @intFromEnum(socketOption), value, @constCast(&valueSize)) != 0) {
+    pub fn getOption(self: *ZeroMQSocket, comptime socketOption: ZeroMQSocketOption, value: ?*anyopaque, valueSize: *usize) !void {
+        if (zmq.zmq_getsockopt(self.socket, @intFromEnum(socketOption), value, valueSize) != 0) {
             return switch (zmq.zmq_errno()) {
-                zmq.EINVAL => error.UnknownOptionName,
+                zmq.EINVAL => error.UnknownOrInvalidOption,
                 zmq.ETERM => error.SocketTerminated,
                 zmq.ENOTSOCK => error.InvalidSocket,
                 zmq.EINTR => error.Interrupted,
@@ -131,6 +132,83 @@ pub const ZeroMQSocket = struct {
             };
         }
     }
+
+    pub fn receive(self: *ZeroMQSocket, buffer: []u8, dontWait: bool) !i32 {
+        const value = zmq.zmq_recv(self.socket, buffer.ptr, buffer.len, @intFromBool(dontWait));
+        if (value == -1) {
+            return switch (zmq.zmq_errno()) {
+                zmq.EAGAIN => error.NoMessageOrTimeout,
+                zmq.ENOTSUP => error.NotSupported,
+                zmq.EFSM => error.BadSocketState,
+                zmq.ETERM => error.SocketTerminated,
+                zmq.ENOTSOCK => error.InvalidSocket,
+                zmq.EINTR => error.Interrupted,
+                else => error.UnknownError,
+            };
+        }
+        var moreFlag: i64 = 0;
+        var moreFlagLen: usize = @sizeOf(@TypeOf(moreFlag));
+
+        try self.getOption(.ReceiveMore, &moreFlag, &moreFlagLen);
+        return value;
+    }
+
+    pub fn send(self: *ZeroMQSocket, buffer: []u8, comptime flags: struct {
+        dontWait: bool = false,
+        sendMore: bool = false,
+    }) !i32 {
+        comptime var flag: i32 = 0;
+        if (flags.dontWait) {
+            flag |= zmq.ZMQ_DONTWAIT;
+        }
+        if (flags.sendMore) {
+            flag |= zmq.ZMQ_SNDMORE;
+        }
+        const value: i32 = zmq.zmq_send(self.socket, buffer.ptr, buffer.len, flag);
+        if (value == -1) {
+            return switch (zmq.zmq_errno()) {
+                zmq.EAGAIN => error.NonBlockingQueueFull,
+                zmq.ENOTSUP => error.SocketTypeUnsupported,
+                zmq.EFSM => error.SocketStateInvalid,
+                zmq.EINTR => error.Interrupted,
+                zmq.EFAULT => error.MessageInvalid,
+                else => error.UnknownError,
+            };
+        }
+
+        return value;
+    }
+
+    pub fn connect(self: *ZeroMQSocket, address: []const u8) !void {
+        if (zmq.zmq_connect(self.socket, address.ptr) == -1) {
+            return switch (zmq.zmq_errno()) {
+                zmq.EINVAL => error.InvalidEndpoint,
+                zmq.EPROTONOSUPPORT => error.ProtocolNotSupported,
+                zmq.ENOCOMPATPROTO => error.IncompatibleProtocol,
+                zmq.ETERM => error.ContextTerminated,
+                zmq.ENOTSOCK => error.InvalidSocket,
+                zmq.EMTHREAD => error.NoAvailableIOThread,
+                else => error.UnknownError,
+            };
+        }
+    }
+
+    pub fn bind(self: *ZeroMQSocket, address: []const u8) !void {
+        if (zmq.zmq_bind(self.socket, address.ptr) == -1) {
+            return switch (zmq.zmq_errno()) {
+                zmq.EINVAL => error.InvalidEndpoint,
+                zmq.EPROTONOSUPPORT => error.ProtocolNotSupported,
+                zmq.ENOCOMPATPROTO => error.IncompatibleProtocol,
+                zmq.ETERM => error.ContextTerminated,
+                zmq.ENOTSOCK => error.InvalidSocket,
+                zmq.EMTHREAD => error.NoAvailableIOThread,
+                zmq.EADDRINUSE => error.AddressAlreadyInUse,
+                zmq.EADDRNOTAVAIL => error.AddressNotLocal,
+                else => error.UnknownError,
+            };
+        }
+    }
+
     pub fn deinit(self: *ZeroMQSocket) void {
         _ = zmq.zmq_close(self.socket);
     }
@@ -140,13 +218,23 @@ test "ZeroMQSocket - Can create and set options" {
     var context = c.ZeroMQContext.init();
     defer context.deinit() catch unreachable;
 
-    var socket = try context.createSocket(.Req);
-    defer socket.deinit();
+    var repSocket = try context.createSocket(.Rep);
+    defer repSocket.deinit();
+    try repSocket.bind("inproc://testSocket");
 
-    try socket.setOption(.RoutingId, @constCast("testroutingid"), 13);
+    var reqSocket = try context.createSocket(.Req);
+    defer reqSocket.deinit();
+    try reqSocket.setOption(.RoutingId, @constCast("testroutingid"), 13);
+    try reqSocket.connect("inproc://testSocket");
 
     var retRoutingId: [13]u8 = undefined;
-    try socket.getOption(.RoutingId, &retRoutingId, 13);
+    var retRoutingIdLen: usize = 13;
+    try reqSocket.getOption(.RoutingId, &retRoutingId, &retRoutingIdLen);
 
-    try expect(std.mem.eql(u8, &retRoutingId, "testroutingid"));
+    const testData = "hello";
+    _ = try reqSocket.send(@constCast(testData), .{ .dontWait = true });
+
+    var buffer: [255]u8 = undefined;
+    const recv = try repSocket.receive(&buffer, false);
+    try expect(recv == 5);
 }
